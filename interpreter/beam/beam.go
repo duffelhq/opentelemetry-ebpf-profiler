@@ -144,100 +144,79 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		return nil, err
 	}
 
-	_, otpReleaseString, err := ef.SymbolData("etp_otp_release", 4)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read OTP release: %v", err)
+	// OTP 29 builds ERTS with hidden visibility. Read runtime globals from the
+	// full symbol table, which we already need for beam_ranges.c's static r.
+	symbols := map[libpf.SymbolName]libpf.Symbol{
+		"r": {}, "the_active_code_index": {}, "erts_atom_table": {},
+		"beam_normal_exit": {}, "erts_frame_layout": {},
+		"etp_otp_release": {}, "etp_erts_version": {}, "etp_ptr_mask": {},
+		"etp_header_subtag_mask": {}, "etp_heap_bits_subtag": {},
 	}
-	// Slice off the null-terminator before parsing
-	otpRelease, err := strconv.ParseUint(string(otpReleaseString[:len(otpReleaseString)-1]), 10, 32)
-	if err != nil || otpRelease > 255 {
-		return nil, fmt.Errorf("Invalid OTP Release: %v", otpReleaseString)
-	}
-
-	_, ertsVersion, err := ef.SymbolData("etp_erts_version", 64)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read ERTS version: %v", err)
-	}
-
-	// "r" symbol is from:
-	// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/beam_ranges.c#L62
-	// TODO: We want to avoid reading static symbols to find the address of r here,
-	// because it would be removed if the binary is stripped, but it seems that's the only
-	// way to get it currently. If possible, we should get it exported in erl_etp.c
-	var r libpf.Symbol
-	ef.VisitSymbols(func(sym libpf.Symbol) bool {
-		if sym.Name == "r" {
-			r = sym
-			return false
-		} else {
-			return true
+	err = ef.VisitSymbols(func(sym libpf.Symbol) bool {
+		if previous, wanted := symbols[sym.Name]; wanted && previous.Address == 0 && sym.Address != 0 {
+			symbols[sym.Name] = sym
 		}
+		return true
 	})
-	if r.Name != "r" {
-		return nil, fmt.Errorf("symbol 'r' not found")
+	if err != nil {
+		return nil, fmt.Errorf("read BEAM symbol table: %w", err)
+	}
+	for name, sym := range symbols {
+		if sym.Address != 0 {
+			continue
+		}
+		// A partially stripped executable can retain r in .symtab but keep
+		// its exported globals only in .dynsym.
+		exported, err := ef.LookupSymbol(name)
+		if err == nil {
+			symbols[name] = *exported
+		} else if name != "erts_frame_layout" {
+			return nil, fmt.Errorf("missing BEAM symbol %q: %w", name, err)
+		}
 	}
 
-	// "the_active_code_index" symbol is from:
-	// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/code_ix.c#L46
-	codeIndex, _, err := ef.SymbolData("the_active_code_index", 4)
-	if err != nil {
-		return nil, fmt.Errorf("symbol 'the_active_code_index' not found: %v", err)
+	readData := func(name libpf.SymbolName, maxSize uint) ([]byte, error) {
+		sym := symbols[name]
+		data := make([]byte, min(sym.Size, uint64(maxSize)))
+		_, err := ef.ReadAt(data, int64(sym.Address))
+		return data, err
 	}
-
-	// "erts_atom_table" symbol is from:
-	// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/atom.c#L35
-	atomTable, _, err := ef.SymbolData("erts_atom_table", 128)
+	otpReleaseString, err := readData("etp_otp_release", 4)
 	if err != nil {
-		return nil, fmt.Errorf("symbol 'erts_atom_table' not found: %v", err)
+		return nil, fmt.Errorf("read OTP release: %w", err)
 	}
-
-	// "etp_ptr_mask" symbol is from:
-	// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/erl_etp.c#L82-L85
-	_, etpPtrMask, err := ef.SymbolData("etp_ptr_mask", 8)
+	otpRelease, err := strconv.ParseUint(strings.TrimSuffix(string(otpReleaseString), "\x00"), 10, 8)
 	if err != nil {
-		return nil, fmt.Errorf("symbol 'etp_ptr_mask' not found: %v", err)
+		return nil, fmt.Errorf("invalid OTP release %q: %w", otpReleaseString, err)
 	}
-
-	// "etp_header_subtag_mask" is from:
-	// https://github.com/erlang/otp/blob/OTP-28.0.2/erts/emulator/beam/erl_etp.c#L132
-	_, etpHeaderSubtagMask, err := ef.SymbolData("etp_header_subtag_mask", 8)
+	ertsVersion, err := readData("etp_erts_version", 64)
 	if err != nil {
-		return nil, fmt.Errorf("symbol 'etp_header_subtag_mask' not found: %v", err)
+		return nil, fmt.Errorf("read ERTS version: %w", err)
 	}
-
-	// "etp_heap_bits_subtag" is from:
-	// https://github.com/erlang/otp/blob/OTP-28.0.2/erts/emulator/beam/erl_etp.c#L108
-	_, etpHeapBitsSubtag, err := ef.SymbolData("etp_heap_bits_subtag", 8)
+	etpPtrMask, err := readData("etp_ptr_mask", 8)
 	if err != nil {
-		return nil, fmt.Errorf("symbol 'etp_heap_bits_subtag' not found: %v", err)
+		return nil, fmt.Errorf("read etp_ptr_mask: %w", err)
 	}
-
-	// "beam_normal_exit" symbol is from:
-	// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/jit/beam_jit_main.cpp#L54
-	beamNormalExit, _, err := ef.SymbolData("beam_normal_exit", 8)
+	etpHeaderSubtagMask, err := readData("etp_header_subtag_mask", 8)
 	if err != nil {
-		return nil, fmt.Errorf("symbol 'beam_normal_exit' not found: %v", err)
+		return nil, fmt.Errorf("read etp_header_subtag_mask: %w", err)
+	}
+	etpHeapBitsSubtag, err := readData("etp_heap_bits_subtag", 8)
+	if err != nil {
+		return nil, fmt.Errorf("read etp_heap_bits_subtag: %w", err)
 	}
 
 	d := &beamData{
 		otpRelease:          uint8(otpRelease),
-		ertsVersion:         string(ertsVersion[:len(ertsVersion)-1]),
-		theActiveCodeIndex:  libpf.Address(codeIndex.Address),
-		r:                   libpf.Address(r.Address),
-		beamNormalExit:      libpf.Address(beamNormalExit.Address),
-		ertsAtomTable:       uint64(atomTable.Address),
+		ertsVersion:         strings.TrimSuffix(string(ertsVersion), "\x00"),
+		theActiveCodeIndex:  libpf.Address(symbols["the_active_code_index"].Address),
+		r:                   libpf.Address(symbols["r"].Address),
+		beamNormalExit:      libpf.Address(symbols["beam_normal_exit"].Address),
+		ertsAtomTable:       uint64(symbols["erts_atom_table"].Address),
+		ertsFrameLayout:     uint64(symbols["erts_frame_layout"].Address),
 		etpPtrMask:          npsr.Uint64(etpPtrMask, 0),
 		etpHeaderSubtagMask: npsr.Uint64(etpHeaderSubtagMask, 0),
 		etpHeapBitsSubtag:   npsr.Uint64(etpHeapBitsSubtag, 0),
-	}
-
-	// If erts_frame_layout is not defined, it means that frame pointers are not supported,
-	// so use 0 to signify that they're not enabled since that shouldn't be a real offset.
-	erts_frame_layout_symbol, _, err := ef.SymbolData("erts_frame_layout", 8)
-	if err == nil {
-		d.ertsFrameLayout = uint64(erts_frame_layout_symbol.Address)
-	} else {
-		d.ertsFrameLayout = 0
 	}
 
 	vms := &d.vmStructs
@@ -266,10 +245,14 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		vms.beamCodeHeader.sizeOf = 144
 		vms.beamCodeHeader.functions = 136
 		vms.atom.name = 32
-	case 28:
+	case 28, 29:
 		vms.beamCodeHeader.sizeOf = 160
 		vms.beamCodeHeader.functions = 152
 		vms.atom.u.bin = 32
+		if d.otpRelease == 29 {
+			// OTP 29 made func_tab a flexible array at the end of BeamCodeLineTab.
+			vms.beamCodeLineTab.sizeOf = 24
+		}
 	default:
 		return d, fmt.Errorf("unsupported OTP version for BEAM interpreter: %d", d.otpRelease)
 	}
@@ -293,7 +276,7 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 	data := support.BEAMProcInfo{
 		R:                     uint64(bias + d.r),
 		The_active_code_index: uint64(bias + d.theActiveCodeIndex),
-		Beam_normal_exit:      uint64(bias + d.beamNormalExit),
+		Beam_normal_exit:      rm.Uint64(bias + d.beamNormalExit),
 		Ranges_sizeof:         uint8(d.vmStructs.ranges.sizeOf),
 	}
 
@@ -577,7 +560,7 @@ func (i *beamInstance) lookupAtom(index uint32) (libpf.String, error) {
 		if err != nil {
 			return libpf.NullString, fmt.Errorf("BEAM Unable to lookup atom with index %d: %v", index, err)
 		}
-	case 28:
+	case 28, 29:
 		// Implementation based on https://github.com/erlang/otp/blob/OTP-28.0.2/erts/etc/unix/etp-commands.in#L657-L674
 		unboxed := i.rm.Ptr(entry+libpf.Address(vms.atom.u.bin)) & libpf.Address(i.data.etpPtrMask)
 
